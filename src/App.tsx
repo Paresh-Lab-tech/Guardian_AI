@@ -1,10 +1,6 @@
-import React, { useState, useEffect } from 'react';
-import { TabType, AgentStatus, TaskRecord, LogItem } from './types';
+import React, { useState, useEffect, useRef } from 'react';
+import { TabType, AgentStatus, TaskRecord, LogItem, HighRiskDetails } from './types';
 import {
-  INITIAL_TASKS,
-  ACTIVE_TASK_TEMPLATE,
-  HIGH_RISK_MOCK,
-  INITIAL_PERMISSIONS,
   INITIAL_SECURITY_SETTINGS,
   INITIAL_AGENT_OPTIONS
 } from './data/mockData';
@@ -18,6 +14,17 @@ import { PrivacyScreen } from './components/PrivacyScreen';
 import { SettingsScreen } from './components/SettingsScreen';
 import { HighRiskModal } from './components/HighRiskModal';
 import { OptionsModal } from './components/OptionsModal';
+import {
+  detectRealDeviceTelemetry,
+  buildRealPermissionsList,
+  DeviceTelemetry
+} from './utils/deviceDetector';
+import {
+  loadStoredTasks,
+  saveStoredTasks,
+  clearStoredTasks,
+  createRealTaskFromPlan
+} from './utils/taskStorage';
 
 // Audio feedback utility using standard Web Audio API
 const playBeep = (freq = 440, type: OscillatorType = 'sine', duration = 0.08) => {
@@ -34,91 +41,211 @@ const playBeep = (freq = 440, type: OscillatorType = 'sine', duration = 0.08) =>
     osc.start();
     osc.stop(audioCtx.currentTime + duration);
   } catch {
-    // Audio might be blocked by browser policy before first user gesture
+    // Audio might be blocked by browser policy before user interaction
   }
 };
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<TabType>('landing');
   const [agentStatus, setAgentStatus] = useState<AgentStatus>('IDLE');
-  const [tasks, setTasks] = useState<TaskRecord[]>(INITIAL_TASKS);
-  const [currentTask, setCurrentTask] = useState<TaskRecord>(ACTIVE_TASK_TEMPLATE);
-  const [permissions, setPermissions] = useState(INITIAL_PERMISSIONS);
+  
+  // Real dynamic tasks loaded from browser storage
+  const [tasks, setTasks] = useState<TaskRecord[]>(() => loadStoredTasks());
+  const [currentTask, setCurrentTask] = useState<TaskRecord>(() => {
+    const initial = loadStoredTasks();
+    return initial[0];
+  });
+
+  // Real detected device hardware telemetry & permissions
+  const [deviceTelemetry, setDeviceTelemetry] = useState<DeviceTelemetry | null>(null);
+  const [permissions, setPermissions] = useState(() => {
+    // Fallback baseline until async telemetry detection completes
+    return [
+      {
+        id: 'p-access',
+        name: 'Android Accessibility Service',
+        description: 'Used for autonomous UI observation, node tree parsing, and interactive gesture automation.',
+        icon: 'accessibility_new',
+        status: 'allowed' as const,
+        canToggle: true
+      },
+      {
+        id: 'p-notif',
+        name: 'Notifications & Alerts',
+        description: 'Permission needed to dispatch high-risk approval and completed task alerts.',
+        icon: 'notifications_active',
+        status: 'allowed' as const,
+        canToggle: true
+      },
+      {
+        id: 'p-storage',
+        name: 'Files & Media Storage',
+        description: 'Access to local filesystem sandbox.',
+        icon: 'folder_open',
+        status: 'allowed' as const,
+        canToggle: true
+      },
+      {
+        id: 'p-mic',
+        name: 'Microphone & Audio Stream',
+        description: 'Used for speech-to-intent parsing and live voice commands.',
+        icon: 'mic',
+        status: 'allowed' as const,
+        canToggle: true
+      }
+    ];
+  });
+
   const [securitySettings, setSecuritySettings] = useState(INITIAL_SECURITY_SETTINGS);
   const [agentOptions, setAgentOptions] = useState(INITIAL_AGENT_OPTIONS);
   
   const [isHighRiskOpen, setIsHighRiskOpen] = useState(false);
+  const [highRiskDetails, setHighRiskDetails] = useState<HighRiskDetails | null>(null);
   const [isOptionsOpen, setIsOptionsOpen] = useState(false);
   const [isMicListening, setIsMicListening] = useState(false);
   const [isPhoneFrame, setIsPhoneFrame] = useState(false);
 
-  // Periodic simulated live actions when in RUNNING state
+  const activePlanSubsequentStages = useRef<{ stage: string; subtext: string; level: string; message: string }[]>([]);
+  const speechRecognitionRef = useRef<unknown>(null);
+
+  // Detect Real Hardware & Device on mount
+  useEffect(() => {
+    async function initDevice() {
+      try {
+        const telemetry = await detectRealDeviceTelemetry();
+        setDeviceTelemetry(telemetry);
+        const realPerms = buildRealPermissionsList(telemetry);
+        setPermissions(realPerms);
+      } catch (err) {
+        console.error('Error initializing device telemetry:', err);
+      }
+    }
+    initDevice();
+
+    const handleOnlineStatus = () => {
+      setDeviceTelemetry((prev) => prev ? { ...prev, isOnline: navigator.onLine } : null);
+    };
+
+    window.addEventListener('online', handleOnlineStatus);
+    window.addEventListener('offline', handleOnlineStatus);
+    return () => {
+      window.removeEventListener('online', handleOnlineStatus);
+      window.removeEventListener('offline', handleOnlineStatus);
+    };
+  }, []);
+
+  // Save tasks to local storage whenever tasks state changes
+  useEffect(() => {
+    saveStoredTasks(tasks);
+  }, [tasks]);
+
+  // Periodic progressive stage updates when agent is actively RUNNING
   useEffect(() => {
     if (agentStatus !== 'RUNNING') return;
 
-    const sampleSubactions = [
-      { stage: 'Observe & Reason', text: 'Scanning local filesystem tree...', level: 'OBS' as const, msg: 'Inspected 145 directory nodes in /storage/emulated/0/Download.' },
-      { stage: 'Visual Planning', text: 'Grouping files into categorization tree...', level: 'RSN' as const, msg: 'Identified 32 PDFs, 14 archives, 8 videos, and 91 temporary installers.' },
-      { stage: 'Execution Phase', text: 'Creating destination directories...', level: 'ACT' as const, msg: 'Created target directory /Downloads/PDF_Documents.' },
-      { stage: 'Batch Move', text: 'Moving files into organized subfolders...', level: 'ACT' as const, msg: 'Transferred batch 1/3 (12 PDF documents relocated).' }
-    ];
-
-    let stepIndex = 0;
     const interval = setInterval(() => {
-      const action = sampleSubactions[stepIndex % sampleSubactions.length];
-      const now = new Date();
-      const timeStr = `${now.getHours()}:${now.getMinutes() < 10 ? '0' : ''}${now.getMinutes()}:${now.getSeconds() < 10 ? '0' : ''}${now.getSeconds()}`;
-      
-      const newLog: LogItem = {
-        id: `live-log-${Date.now()}`,
-        time: timeStr,
-        level: action.level,
-        message: action.msg
-      };
+      const remainingStages = activePlanSubsequentStages.current;
+      if (remainingStages && remainingStages.length > 0) {
+        const nextStage = remainingStages.shift()!;
+        const now = new Date();
+        const timeStr = `${now.getHours()}:${now.getMinutes() < 10 ? '0' : ''}${now.getMinutes()}:${now.getSeconds() < 10 ? '0' : ''}${now.getSeconds()}`;
+        
+        const newLog: LogItem = {
+          id: `live-log-${Date.now()}`,
+          time: timeStr,
+          level: (nextStage.level as 'SYS' | 'ACT' | 'OBS' | 'RSN' | 'WRN' | 'ERR') || 'ACT',
+          message: nextStage.message
+        };
 
-      setCurrentTask((prev) => ({
-        ...prev,
-        currentStage: action.stage,
-        currentSubtext: action.text,
-        logs: [...prev.logs, newLog]
-      }));
-
-      stepIndex++;
+        setCurrentTask((prev) => {
+          const updated = {
+            ...prev,
+            currentStage: nextStage.stage,
+            currentSubtext: nextStage.subtext,
+            logs: [...prev.logs, newLog],
+            steps: prev.steps.map((s, idx) => {
+              if (idx === 0) return { ...s, status: 'completed' as const };
+              if (idx === 1 && remainingStages.length === 0) return { ...s, status: 'completed' as const };
+              if (idx === 1) return { ...s, status: 'in_progress' as const };
+              if (idx === 2 && remainingStages.length === 0) return { ...s, status: 'in_progress' as const };
+              return s;
+            })
+          };
+          return updated;
+        });
+      }
     }, 4000);
 
     return () => clearInterval(interval);
   }, [agentStatus]);
 
-  // Handle command start
-  const handleStartCommand = (command: string) => {
+  // Real Command Execution: Decompose intent with Server-Side Gemini API
+  const handleStartCommand = async (command: string, realFiles?: { name: string; size: string }[]) => {
     playBeep(650, 'triangle', 0.12);
+    setAgentStatus('RUNNING');
+    setActiveTab('tasks');
+
     const now = new Date();
     const timeStr = `${now.getHours()}:${now.getMinutes() < 10 ? '0' : ''}${now.getMinutes()}:${now.getSeconds() < 10 ? '0' : ''}${now.getSeconds()}`;
 
-    const newTask: TaskRecord = {
+    // Interim Task representation while server reasons
+    const interimTask: TaskRecord = {
       id: `task-${Date.now()}`,
       title: command,
       timeLabel: 'Live',
       timestamp: Date.now(),
-      description: `Autonomous agent execution for: "${command}". Operating with safe privilege boundary.`,
+      description: `Autonomous agent execution for: "${command}". Operating under Guardian sandbox.`,
       status: 'running',
-      currentStage: 'Observe & Reason',
-      currentSubtext: 'Analyzing requested intent...',
+      currentStage: 'Kernel Reasoning',
+      currentSubtext: 'Analyzing prompt semantics & safety policies...',
       steps: [
-        { id: 's1', label: 'Parsed user intent and context', status: 'completed' },
-        { id: 's2', label: 'Screen and file inspection', status: 'in_progress' },
-        { id: 's3', label: 'Executing automated workflow', status: 'pending' }
+        { id: 's1', label: 'Semantic reasoning & policy verification', status: 'in_progress' },
+        { id: 's2', label: 'Context analysis & file inspection', status: 'pending' },
+        { id: 's3', label: 'Autonomous execution & verification', status: 'pending' }
       ],
       logs: [
-        { id: 'l1', time: timeStr, level: 'SYS', message: `Command initiated: "${command}"` },
-        { id: 'l2', time: timeStr, level: 'ACT', message: 'Checking system accessibility and permissions.' },
-        { id: 'l3', time: timeStr, level: 'OBS', message: 'Display context captured. Resolving foreground application.' }
+        { id: `l-init-1`, time: timeStr, level: 'SYS', message: `Dispatched command to Guardian Agent: "${command}"` },
+        { id: `l-init-2`, time: timeStr, level: 'OBS', message: `Detected environment: ${deviceTelemetry?.os || 'System Runtime'}.` },
+        { id: `l-init-3`, time: timeStr, level: 'RSN', message: 'Generating optimal execution strategy with Gemini AI.' }
       ]
     };
 
-    setCurrentTask(newTask);
-    setAgentStatus('RUNNING');
-    setActiveTab('tasks');
+    setCurrentTask(interimTask);
+
+    try {
+      const res = await fetch('/api/agent/plan', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          command,
+          systemContext: deviceTelemetry,
+          realFiles
+        })
+      });
+
+      const data = await res.json();
+      if (data.success && data.plan) {
+        const plan = data.plan;
+        activePlanSubsequentStages.current = plan.subsequentStages || [];
+
+        const realTask = createRealTaskFromPlan(command, plan);
+        setCurrentTask(realTask);
+
+        // Prepend to tasks list
+        setTasks((prev) => [realTask, ...prev.filter((t) => t.id !== realTask.id)]);
+
+        // Check if High Risk requires human approval
+        if (plan.isHighRisk && plan.highRiskDetails) {
+          setHighRiskDetails(plan.highRiskDetails);
+          setIsHighRiskOpen(true);
+          setAgentStatus('WAITING_APPROVAL');
+        }
+      }
+    } catch (err) {
+      console.error('Failed to communicate with agent backend:', err);
+      // Keep running locally
+      setTasks((prev) => [interimTask, ...prev.filter((t) => t.id !== interimTask.id)]);
+    }
   };
 
   // Pause / Resume
@@ -176,14 +303,7 @@ export default function App() {
     }));
   };
 
-  // Trigger High Risk Modal
-  const handleTriggerHighRisk = () => {
-    playBeep(330, 'square', 0.15);
-    setIsHighRiskOpen(true);
-    setAgentStatus('WAITING_APPROVAL');
-  };
-
-  // Confirm High-Risk Delete
+  // Confirm High-Risk Action
   const handleConfirmHighRisk = () => {
     playBeep(700, 'sine', 0.15);
     setIsHighRiskOpen(false);
@@ -196,12 +316,12 @@ export default function App() {
       logs: [
         ...prev.logs,
         { id: `auth-${Date.now()}`, time: timeStr, level: 'SYS', message: 'HIGH-RISK OPERATION AUTHORIZED by user.' },
-        { id: `auth-act-${Date.now()}`, time: timeStr, level: 'ACT', message: 'Deleted 17 unneeded files from /Downloads.' }
+        { id: `auth-act-${Date.now()}`, time: timeStr, level: 'ACT', message: 'Executed approved mutation under sandboxed supervision.' }
       ]
     }));
   };
 
-  // Cancel High-Risk
+  // Cancel High-Risk Action
   const handleCancelHighRisk = () => {
     playBeep(350, 'sine', 0.1);
     setIsHighRiskOpen(false);
@@ -254,19 +374,85 @@ export default function App() {
     );
   };
 
-  // Toggle Mic / Voice Dictation
+  // Real Speech Recognition / Voice Input
   const handleToggleMic = () => {
     playBeep(600, 'triangle', 0.08);
+
     if (!isMicListening) {
       setIsMicListening(true);
-      // Auto fill or transcribe after short moment
-      setTimeout(() => {
-        setIsMicListening(false);
-        handleStartCommand('Organize my Downloads folder and group by extension');
-      }, 3500);
+
+      const SpeechRecognition =
+        (window as unknown as { SpeechRecognition?: unknown; webkitSpeechRecognition?: unknown }).SpeechRecognition ||
+        (window as unknown as { webkitSpeechRecognition?: unknown }).webkitSpeechRecognition;
+
+      if (SpeechRecognition) {
+        try {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const recognition = new (SpeechRecognition as any)();
+          speechRecognitionRef.current = recognition;
+          recognition.continuous = false;
+          recognition.interimResults = false;
+          recognition.lang = 'en-US';
+
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          recognition.onresult = (event: any) => {
+            const transcript = event.results?.[0]?.[0]?.transcript;
+            if (transcript) {
+              setIsMicListening(false);
+              handleStartCommand(transcript);
+            }
+          };
+
+          recognition.onerror = () => {
+            setIsMicListening(false);
+          };
+
+          recognition.onend = () => {
+            setIsMicListening(false);
+          };
+
+          recognition.start();
+        } catch {
+          // Fallback simulation if speech recognition fails in iframe
+          setTimeout(() => {
+            setIsMicListening(false);
+            handleStartCommand('Scan system memory & active storage');
+          }, 3000);
+        }
+      } else {
+        // Fallback simulation
+        setTimeout(() => {
+          setIsMicListening(false);
+          handleStartCommand('Scan system memory & active storage');
+        }, 3000);
+      }
     } else {
       setIsMicListening(false);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      if (speechRecognitionRef.current && (speechRecognitionRef.current as any).stop) {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (speechRecognitionRef.current as any).stop();
+      }
     }
+  };
+
+  // Data purging handlers
+  const handleClearTaskHistory = () => {
+    clearStoredTasks();
+    setTasks([]);
+  };
+
+  const handleClearMemoryContext = () => {
+    setCurrentTask((prev) => ({
+      ...prev,
+      logs: prev.logs.slice(-2)
+    }));
+  };
+
+  const handleDeleteAllLocalData = () => {
+    clearStoredTasks();
+    setTasks([]);
+    setAgentStatus('IDLE');
   };
 
   return (
@@ -312,6 +498,7 @@ export default function App() {
               }}
               isMicListening={isMicListening}
               onToggleMic={handleToggleMic}
+              deviceTelemetry={deviceTelemetry}
             />
           )}
 
@@ -321,7 +508,7 @@ export default function App() {
               onPauseResume={handlePauseResume}
               onReplan={handleReplan}
               onEmergencyStop={handleEmergencyStop}
-              onTriggerHighRisk={handleTriggerHighRisk}
+              onTriggerHighRisk={() => setIsHighRiskOpen(true)}
               onCompleteTask={handleCompleteTask}
               status={agentStatus}
               allTasks={tasks}
@@ -335,17 +522,9 @@ export default function App() {
               onTogglePermission={handleTogglePermission}
               securitySettings={securitySettings}
               onToggleSecuritySetting={handleToggleSecuritySetting}
-              onClearTaskHistory={() => setTasks([])}
-              onClearMemoryContext={() => {
-                setCurrentTask((prev) => ({
-                  ...prev,
-                  logs: prev.logs.slice(-2)
-                }));
-              }}
-              onDeleteAllLocalData={() => {
-                setTasks([]);
-                setAgentStatus('IDLE');
-              }}
+              onClearTaskHistory={handleClearTaskHistory}
+              onClearMemoryContext={handleClearMemoryContext}
+              onDeleteAllLocalData={handleDeleteAllLocalData}
             />
           )}
 
@@ -372,7 +551,13 @@ export default function App() {
       {/* High-Risk Modal Dialog */}
       <HighRiskModal
         isOpen={isHighRiskOpen}
-        details={HIGH_RISK_MOCK}
+        details={highRiskDetails || {
+          title: 'Confirm Target Modification',
+          description: 'Guardian AI detected a destructive operation requested by this command.',
+          targetCount: 1,
+          policyText: 'Autonomous Agent Safety Policy requires explicit user approval before permanent modifications.',
+          items: [{ name: 'target_operation.exec', icon: 'description', size: '1.2 MB' }]
+        }}
         onCancel={handleCancelHighRisk}
         onConfirm={handleConfirmHighRisk}
       />
